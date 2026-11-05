@@ -1,3 +1,13 @@
+# ⚠️⚠️ THIS IS A CUSTOM PATCH SET ⚠️⚠️
+
+Based on [cd959bae99ff4bed22bef2604f45241c09bbb8c8](https://github.com/ggml-org/llama.cpp/commit/cd959bae99ff4bed22bef2604f45241c09bbb8c8) - [0.9 tag](https://github.com/ggml-org/llama.cpp/releases/tag/v0.9.0)
+
+Includes:
+
+  * One commit with this README update
+  * https://github.com/ggml-org/llama.cpp/pull/29738 - rebased: [499f71f800a9351d6312f4a8b916b4df1319c24c](https://github.com/ggml-org/llama.cpp/commit/499f71f800a9351d6312f4a8b916b4df1319c24c)
+  * Session save/restore fixes
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
