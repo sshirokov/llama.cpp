@@ -7,6 +7,30 @@ import struct
 # sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
 STATE_FILE_HEADER_SIZE = 12
 
+# session dumps are written as llama-session-<modeltag>-<sid>.bin, where the 8-char model
+# tag namespaces the file per model (router mode). The tag is unknown here, so a dump is
+# identified by its stable prefix and its -<sid>.bin suffix.
+SESSION_PREFIX = "llama-session-"
+SESSION_SUFFIX = ".bin"
+SESSION_TAG_LEN = 8
+
+
+def session_dumps(server):
+    return [n for n in os.listdir(server.slot_save_path)
+            if n.startswith(SESSION_PREFIX) and n.endswith(SESSION_SUFFIX)]
+
+
+def session_dump_sid(name):
+    rest = name[len(SESSION_PREFIX):-len(SESSION_SUFFIX)]  # <modeltag>-<sid>
+    return rest[SESSION_TAG_LEN + 1:]                      # strip <modeltag>-
+
+
+def session_dump(server, sid):
+    for name in session_dumps(server):
+        if session_dump_sid(name) == sid:
+            return os.path.join(server.slot_save_path, name)
+    return None
+
 server = ServerPreset.tinyllama2()
 server_noflag = ServerPreset.tinyllama2()
 
@@ -981,9 +1005,8 @@ def test_session_autosave_restore():
     assert res.body["timings"]["prompt_n"] == 1
     assert res.body["timings"]["cache_n"] == prompt_n_a - 1
 
-    # the evicted session file is on disk, named from the session id
-    files = [f for f in os.listdir(server.slot_save_path) if f.endswith(".bin")]
-    assert files == ["llama-session-a.bin"]
+    # the evicted session file is on disk, named from the session id (model-tagged)
+    assert [session_dump_sid(f) for f in session_dumps(server)] == ["a"]
 
     # the sessions are visible per slot
     res = server.make_request("GET", "/slots")
@@ -1110,8 +1133,7 @@ def test_session_autosave_on_shutdown():
 
     # on shutdown the in-memory session state must be flushed to disk
     server.stop()
-    files = [f for f in os.listdir(server.slot_save_path) if f.endswith(".bin")]
-    assert files == ["llama-session-a.bin"]
+    assert [session_dump_sid(f) for f in session_dumps(server)] == ["a"]
 
     # in the new process the session must restore from that file
     server.start()
@@ -1154,8 +1176,7 @@ def test_session_autosave_on_sleep():
     else:
         pytest.fail("server did not go to sleep")
 
-    files = [f for f in os.listdir(server.slot_save_path) if f.endswith(".bin")]
-    assert files == ["llama-session-a.bin"]
+    assert [session_dump_sid(f) for f in session_dumps(server)] == ["a"]
 
     # in the new process the session must restore from that file
     server.stop()
@@ -1265,8 +1286,7 @@ def test_session_max_sessions():
         assert res.status_code == 200
 
     # c holds the slot, b is on disk, the oldest (a) was pruned by the cap
-    files = set(os.listdir(server.slot_save_path))
-    assert files == {"llama-session-b.bin"}
+    assert {session_dump_sid(f) for f in session_dumps(server)} == {"b"}
 
     # request a new session: c is evicted to disk, b is pruned
     res = server.make_request("POST", "/completion", data={
@@ -1275,33 +1295,113 @@ def test_session_max_sessions():
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    files = set(os.listdir(server.slot_save_path))
-    assert files == {"llama-session-c.bin"}
+    assert {session_dump_sid(f) for f in session_dumps(server)} == {"c"}
 
 
 def test_session_sweep_counts_disk_files():
     global server
-    server.session_max_sessions = 1
 
-    # a session file left by a previous run, older than anything created now
-    fake = os.path.join(server.slot_save_path, "llama-session-z.bin")
-    with open(fake, "wb") as f:
-        f.write(b"")
-    past = time.time() - 86400
-    os.utime(fake, (past, past))
-
+    # previous run (default cap): evict a session so its dump is left on disk
+    # (a plain stop does not flush, so the dump is created by eviction)
     server.start()
-
-    # the file must be registered at startup and count against the cap
     res = server.make_request("POST", "/completion", data={
         "prompt": "What is the capital of France?",
+        "session_id": "z",
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    slot_id_z = res.body["id_slot"]
+    # pin another session to the same slot to evict z to disk
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of Germany?",
+        "session_id": "w",
+        "id_slot": slot_id_z,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    zdump = session_dump(server, "z")
+    assert zdump is not None
+    server.stop()
+
+    # age the leftover dump so it is older than anything created on the next run
+    past = time.time() - 86400
+    os.utime(zdump, (past, past))
+
+    # this run (cap of 1): the leftover must be registered at startup and count
+    # against the cap, so it is pruned when the new session arrives
+    server.session_max_sessions = 1
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of Italy?",
         "session_id": "a",
         "cache_prompt": True,
     })
     assert res.status_code == 200
 
     # the pre-existing file was the oldest, so it was pruned
-    assert not os.path.exists(fake)
+    assert not os.path.exists(zdump)
+
+
+def test_session_eviction_orders_stale_disk_sessions():
+    global server
+    server.n_slots = 1
+    server.start()
+
+    # previous run: two sessions, the first evicted to disk by the second
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?",
+        "session_id": "a",
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of Germany?",
+        "session_id": "w",
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    server.stop()
+
+    # age the leftover dumps, with distinct mtimes, so they all predate this run
+    past = time.time() - 86400
+    for i, name in enumerate(sorted(session_dumps(server))):
+        t = past - i * 60
+        os.utime(os.path.join(server.slot_save_path, name), (t, t))
+
+    # this run: one slot, cap of 2. the stale dumps are registered at startup, so
+    # with two in-memory sessions the cap is full and the new session must evict
+    # the oldest entry, which is a stale disk session, not an in-memory one
+    server.session_max_sessions = 2
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of Italy?",
+        "session_id": "b",
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    prompt_n_b = res.body["timings"]["prompt_n"]
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of Spain?",
+        "session_id": "c",
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    # the stale dump(s) were pruned before b, whose dump survived
+    assert {session_dump_sid(f) for f in session_dumps(server)} == {"b"}
+
+    # b restores from its dump
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of Italy?",
+        "session_id": "b",
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["prompt_n"] == 1
+    assert res.body["timings"]["cache_n"] == prompt_n_b - 1
 
 
 def test_session_sweep_gated_by_flag():
@@ -1318,7 +1418,7 @@ def test_session_sweep_gated_by_flag():
     assert os.path.exists(fake)
 
 
-def test_session_autosave_dft_pair(tmp_path):
+def test_session_autosave_draft_state(tmp_path):
     # speculative server: the draft context state is saved and restored alongside the main one
     server = ServerPreset.stories15m_moe()
     server.slot_save_path = str(tmp_path)
@@ -1350,9 +1450,8 @@ def test_session_autosave_dft_pair(tmp_path):
     })
     assert res.status_code == 200
 
-    # both the target and the draft state files are written
-    files = set(os.listdir(server.slot_save_path))
-    assert files == {"llama-session-a.bin", "llama-session-a.dft"}
+    # the target and draft state are written to the same file
+    assert {session_dump_sid(f) for f in session_dumps(server)} == {"a"}
 
     # restart: the session restores with the draft state included
     server.stop()
@@ -1367,16 +1466,15 @@ def test_session_autosave_dft_pair(tmp_path):
     assert res.body["timings"]["prompt_n"] == 1
     assert res.body["timings"]["cache_n"] == prompt_n_a - 1
 
-    # with a cap of one session, exactly one pair of files survives the startup sweep
+    # with a cap of one session, exactly one file survives the startup sweep
     server.session_max_sessions = 1
     server.stop()
     server.start()
-    files = set(os.listdir(server.slot_save_path))
-    assert len(files) == 2
-    sid = next(f[len("llama-session-"):-4] for f in files if f.endswith(".bin"))
-    assert files == {f"llama-session-{sid}.bin", f"llama-session-{sid}.dft"}
+    files = session_dumps(server)
+    assert len(files) == 1
+    sid = session_dump_sid(next(iter(files)))
 
-    # the surviving session restores from its pair
+    # the surviving session restores from its file
     prompt_map = {"a": prompt_a, "c": "What is the capital of Germany?"}
     res = server.make_request("POST", "/completion", data={
         "prompt": prompt_map[sid],
@@ -1386,12 +1484,78 @@ def test_session_autosave_dft_pair(tmp_path):
     assert res.status_code == 200
     assert res.body["timings"]["prompt_n"] == 1
 
-    # a new session evicts the survivor and prunes its pair
+    # a new session evicts the survivor and prunes its file
     res = server.make_request("POST", "/completion", data={
         "prompt": "What is the capital of Spain?",
         "session_id": "d",
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    files = set(os.listdir(server.slot_save_path))
-    assert files == set()
+    assert session_dumps(server) == []
+
+
+# a session dump reuses the shared slot save/restore file format, so it carries the context checkpoints
+def test_session_autosave_carries_context_checkpoints(tmp_path):
+    server = ServerPreset.tinygemma3()
+    server.slot_save_path = str(tmp_path)
+    server.temperature = 0.0
+    server.cache_ram = 0
+    # Keep the first prompt checkpoint before the divergence point.
+    server.n_ubatch = 32
+    server.session_id_headers = "x-session-id,session_id"
+    server.start()
+
+    base = "The quick brown fox jumps over the lazy dog. " * 20
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "The first ending of this story is a happy one.",
+        "session_id": "a",
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    n_full = res.body["timings"]["prompt_n"]
+    slot_id_a = res.body["id_slot"]
+
+    # a divergent prompt leaves a checkpoint before the divergence point
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "But the second ending was different and sad.",
+        "session_id": "a",
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    n_live = res.body["timings"]["prompt_n"]
+    assert n_live < n_full
+
+    # make the live state the first ending again, so it is what gets evicted
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "The first ending of this story is a happy one.",
+        "session_id": "a",
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    # evict session a to disk by pinning another session to its slot
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "The third ending never happened at all.",
+        "session_id": "b",
+        "id_slot": slot_id_a,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    # the dump holds the checkpoint appendix, like a manual slot save
+    a_dump = session_dump(server, "a")
+    assert a_dump is not None
+    with open(a_dump, "rb") as f:
+        off, ckpts = parse_ckpt_appendix(f.read())
+    assert len(ckpts) > 0
+
+    # the restored session resumes the divergent prompt from the saved checkpoint
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "But the second ending was different and sad.",
+        "session_id": "a",
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["session_id"] == "a"
+    assert res.body["timings"]["prompt_n"] == n_live

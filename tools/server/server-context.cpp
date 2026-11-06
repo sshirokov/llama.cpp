@@ -24,6 +24,7 @@
 #include "base64.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
 #include <deque>
@@ -1524,28 +1525,36 @@ private:
 
         // index the session files saved by previous runs so they can be restored,
         // dropping the oldest ones beyond the cap and registering the survivors
-        // the target and draft files of a session share its id and count as one entry
         if (params_base.session_id_enabled && !params_base.slot_save_path.empty()) {
+            const std::string prefix = "llama-session-" + session_model_tag() + "-";
+            const std::string suffix = ".bin";
             std::map<std::string, int64_t> ondisk; // session id -> last modification time
-            std::map<std::string, std::vector<fs::path>> paths;
+
+            // the registry compares t_last against ggml_time_us() (monotonic) values,
+            // so map each file's mtime onto the same axis: the current time at this
+            // instant minus how long ago the file was last written
+            const int64_t t0 = ggml_time_us();
+            const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+
             std::error_code ec_scan;
             for (const auto & entry : fs::directory_iterator(params_base.slot_save_path, ec_scan)) {
                 if (!entry.is_regular_file()) {
                     continue;
                 }
                 const std::string name = entry.path().filename().u8string();
-                if (name.size() <= 18 || name.substr(0, 14) != "llama-session-") {
+                if (name.size() <= prefix.size() + suffix.size() ||
+                    name.substr(0, prefix.size()) != prefix ||
+                    name.substr(name.size() - suffix.size()) != suffix) {
                     continue;
                 }
-                if (name.substr(name.size() - 4) != ".bin" && name.substr(name.size() - 4) != ".dft") {
-                    continue;
-                }
-                const std::string sid = name.substr(14, name.size() - 18);
+                const std::string sid = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
                 std::error_code ec_mtime;
                 const auto mtime = fs::last_write_time(entry.path(), ec_mtime);
-                const int64_t t = ec_mtime ? int64_t(0) : mtime.time_since_epoch().count();
+                const int64_t mtime_ns = ec_mtime ? int64_t(0) : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    mtime.time_since_epoch()).count();
+                const int64_t t = ec_mtime ? int64_t(0) : t0 - (now_ns - mtime_ns);
                 ondisk[sid] = std::max(ondisk[sid], t);
-                paths[sid].push_back(entry.path());
             }
 
             std::vector<std::string> order;
@@ -1559,12 +1568,9 @@ private:
 
             const size_t n_keep = std::min<size_t>(order.size(), (size_t) params_base.session_max_sessions);
             for (size_t i = n_keep; i < order.size(); ++i) {
-                for (const auto & path : paths[order[i]]) {
-                    std::error_code ec;
-                    fs::remove(path, ec);
-                }
+                std::error_code ec;
+                fs::remove(session_filepath(order[i]), ec);
                 ondisk.erase(order[i]);
-                paths.erase(order[i]);
             }
 
             // register the surviving sessions so they count against the cap
@@ -1900,14 +1906,28 @@ private:
 
     // file name of the session save file inside slot_save_path
     // the client-supplied id must pass fs_validate_filename, checked when the request is parsed
-    std::string session_filepath(const std::string & session_id) const {
-        return params_base.slot_save_path + "llama-session-" + session_id + ".bin";
+    // a short deterministic tag derived from the model path, so that in router mode
+    // each model writing to a shared --slot-save-path keeps its own per-session dumps
+    // (llama-session-<tag>-<id>.bin) instead of clobbering another model's files
+    std::string session_model_tag() const {
+        const std::string & src = params_base.model.path.empty() ? model_name : params_base.model.path;
+        uint64_t h = 14695981039346656037ULL; // FNV-1a 64-bit offset basis
+        for (const unsigned char c : src) {
+            h = (h ^ c) * 1099511628211ULL;   // FNV-1a 64-bit prime
+        }
+        static const char * hex = "0123456789abcdef";
+        char buf[9];
+        uint32_t v = (uint32_t)(h & 0xffffffffu);
+        for (int i = 7; i >= 0; --i) {
+            buf[i] = hex[v & 0xf];
+            v >>= 4;
+        }
+        buf[8] = '\0';
+        return std::string(buf);
     }
 
-    // companion file with the draft context state, written when speculative decoding is active
-    // the suffix is distinct from .bin so it is not parsed as a session file of its own
-    std::string session_dft_filepath(const std::string & session_id) const {
-        return params_base.slot_save_path + "llama-session-" + session_id + ".dft";
+    std::string session_filepath(const std::string & session_id) const {
+        return params_base.slot_save_path + "llama-session-" + session_model_tag() + "-" + session_id + ".bin";
     }
 
     // pick an idle slot: the requested one if given, else the least recently used
@@ -1932,8 +1952,8 @@ private:
         return ret;
     }
 
-    // serialize the prompt and KV state of the slot to a file
-    // returns the number of bytes written, 0 on failure (the reason goes to err_msg if set)
+    // serialize the prompt, KV state, context checkpoints and draft state of the slot to a file
+    // returns the total number of bytes written, 0 on failure (the file is removed, the reason goes to err_msg if set)
     size_t slot_save_to_file(server_slot & slot, const std::string & filepath, double & t_ms, std::string * err_msg) {
         const int64_t t_start = ggml_time_us();
 
@@ -1954,13 +1974,46 @@ private:
             ctx_tgt, filepath.c_str(), slot.id,
             reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
 
+        size_t n_total = nwrite;
+        bool ok = nwrite != 0;
+        if (ok) {
+            size_t n_ckpt = 0;
+            if (!save_slot_checkpoints(filepath, slot, n_ckpt)) {
+                ok = false;
+                if (err_msg) {
+                    *err_msg = "failed to append context checkpoints";
+                }
+            } else {
+                n_total += n_ckpt;
+            }
+        }
+        if (ok) {
+            size_t n_dft = 0;
+            if (!save_slot_draft(filepath, slot, n_dft)) {
+                ok = false;
+                if (err_msg) {
+                    *err_msg = "failed to append draft state";
+                }
+            } else {
+                n_total += n_dft;
+            }
+        }
+
+        if (!ok) {
+            // a truncated state file is worse than none
+            std::error_code ec;
+            fs::remove(filepath, ec);
+            t_ms = 0.0;
+            return 0;
+        }
+
         t_ms = (ggml_time_us() - t_start) / 1000.0;
 
-        return nwrite;
+        return n_total;
     }
 
-    // load the prompt and KV state of the slot from a file
-    // returns the number of bytes read, 0 on failure (the slot is cleared on failure, the reason goes to err_msg if set)
+    // load the prompt, KV state, context checkpoints and draft state of the slot from a file
+    // returns the total number of bytes read, 0 on failure (the slot is cleared on failure, the reason goes to err_msg if set)
     size_t slot_restore_from_file(server_slot & slot, const std::string & filepath, double & t_ms, std::string * err_msg) {
         const int64_t t_start = ggml_time_us();
 
@@ -1999,24 +2052,17 @@ private:
             nread = 0;
         }
 
-        if (nread > 0 && ctx_dft != nullptr) {
-            // restore the draft context state, continue without it if unavailable
-            std::string dftpath = filepath;
-            if (dftpath.size() > 4 && dftpath.compare(dftpath.size() - 4, 4, ".bin") == 0) {
-                dftpath.replace(dftpath.size() - 4, 4, ".dft");
-            }
-            if (fs::exists(dftpath)) {
-                llama_token dft_tokens[1];
-                size_t n_packed_dft = 0;
-                if (llama_state_seq_load_file(ctx_dft, dftpath.c_str(), slot.id, dft_tokens, 1, &n_packed_dft) == 0) {
-                    SLT_WRN(slot, "failed to restore draft state from %s, continuing without it\n", dftpath.c_str());
-                }
-            }
+        size_t n_total = nread;
+        if (nread > 0) {
+            // nread is the end offset of the llama state payload within the file
+            const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, slot);
+            const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, slot);
+            n_total = nread + nread_ckpt + nread_dft;
         }
 
         t_ms = (ggml_time_us() - t_start) / 1000.0;
 
-        return nread;
+        return n_total;
     }
 
     // persist the session held by the slot to disk and clear the stamp
@@ -2030,19 +2076,12 @@ private:
 
         if (!params_base.slot_save_path.empty()) {
             const std::string filepath = session_filepath(sid);
-            const std::string dftpath = ctx_dft != nullptr ? session_dft_filepath(sid) : std::string();
 
             double t_ms = 0.0;
             std::string err_msg;
             const size_t n_bytes = slot_save_to_file(slot, filepath, t_ms, &err_msg);
             if (n_bytes == 0) {
                 SLT_WRN(slot, "failed to save session %s to %s, continuing without persistence\n", sid.c_str(), filepath.c_str());
-            } else if (!dftpath.empty() && llama_state_seq_save_file(ctx_dft, dftpath.c_str(), slot.id, nullptr, 0) == 0) {
-                // the draft state could not be saved, roll back to keep the pair consistent
-                std::error_code ec;
-                fs::remove(filepath, ec);
-                fs::remove(dftpath, ec);
-                SLT_WRN(slot, "failed to save draft state of session %s to %s, continuing without persistence\n", sid.c_str(), dftpath.c_str());
             } else {
                 SLT_DBG(slot, "saved session %s to %s (%.2f ms, %zu bytes)\n", sid.c_str(), filepath.c_str(), t_ms, n_bytes);
             }
@@ -2086,7 +2125,6 @@ private:
                 if (!params_base.slot_save_path.empty()) {
                     std::error_code ec;
                     fs::remove(session_filepath(victim->first), ec);
-                    fs::remove(session_dft_filepath(victim->first), ec);
                 }
                 sessions.erase(victim);
             }
@@ -3611,25 +3649,13 @@ private:
                         break;
                     }
 
-                    size_t nwrite_ckpt = 0;
-                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
-                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
-                        break;
-                    }
-
-                    size_t nwrite_dft = 0;
-                    if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
-                        send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
-                        break;
-                    }
-
                     auto res = std::make_unique<server_task_result_slot_save_load>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
+                    res->n_bytes  = nwrite;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -3659,18 +3685,13 @@ private:
                         break;
                     }
 
-                    // nread is the end offset of the llama state payload within the file
-                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
-                    const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, *slot);
-
-
                     auto res = std::make_unique<server_task_result_slot_save_load>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread + nread_ckpt + nread_dft;
+                    res->n_bytes  = nread;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
